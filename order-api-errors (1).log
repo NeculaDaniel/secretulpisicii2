@@ -1,0 +1,12 @@
+[16-Jan-2026 21:47:02 UTC] Oblio Auto-Send executat pentru comanda #87
+[16-Jan-2026 21:47:23 UTC] Oblio Auto-Send executat pentru comanda #88
+[11-Feb-2026 21:52:29 UTC] Ecolet Error: Datele de conectare lipsesc din .env
+[11-Feb-2026 21:52:29 UTC] ECOLET ERROR Comanda #92: Autentificare esuata
+[12-Feb-2026 10:59:24 UTC] Ecolet Error: Datele de conectare lipsesc din .env
+[12-Feb-2026 10:59:24 UTC] ECOLET ERROR Comanda #93: Autentificare esuata
+[12-Feb-2026 12:02:17 UTC] Eroare Token Oblio (401): {"status":401,"statusMessage":"Authorization header not detected"}
+[12-Feb-2026 12:02:17 UTC] Ecolet Error: Datele de conectare lipsesc din .env
+[12-Feb-2026 12:02:17 UTC] ECOLET ERROR Comanda #94: Autentificare esuata
+[12-Feb-2026 12:44:03 UTC] Eroare Token Oblio (401): {"status":401,"statusMessage":"Authorization header not detected"}
+[12-Feb-2026 12:44:03 UTC] Ecolet Auth Failed: {"error":"invalid_client","error_description":"Client authentication failed","message":"Client authentication failed"}
+[12-Feb-2026 12:44:03 UTC] ECOLET ERROR Comanda #95: Autentificare esuata
