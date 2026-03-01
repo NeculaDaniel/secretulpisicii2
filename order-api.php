@@ -1,481 +1,174 @@
 <?php
 /**
- * ==========================================
- * ORDER API - Secretul Pisicii
- * ULTRA-OPTIMIZAT - Raspuns in SUB 2 SECUNDE
- * Email-uri trimise complet in BACKGROUND
- * ==========================================
+ * order-api.php — Secretul Pisicii
+ *
+ * FLOW IDENTIC CU OCLAR:
+ *   RAMBURS → save DB → return orderId → background: email + runAutomations(ramburs_create)
+ *   CARD    → save DB → Netopia init → return paymentUrl — STOP
+ *             email + runAutomations(netopia_confirm) vin DOAR din payment-webhook.php
  */
 
-// === PASUL 1: CURATARE COMPLETA BUFFERE EXISTENTE ===
-// Acest pas este CRITIC - curatam orice buffer existent
-while (ob_get_level() > 0) {
-    ob_end_clean();
-}
-
-// === PASUL 2: CONFIGURARE PENTRU EXECUTIE IN FUNDAL ===
+if (function_exists('apache_setenv')) @apache_setenv('no-gzip', 1);
+@ini_set('zlib.output_compression', 0);
+@ini_set('implicit_flush', 1);
+while (ob_get_level() > 0) ob_end_clean();
 ignore_user_abort(true);
 set_time_limit(0);
-
-// Configurare erori (in fisier, nu pe ecran)
 ini_set('display_errors', 0);
-error_reporting(E_ALL);
-ini_set('log_errors', 1);
-ini_set('error_log', __DIR__ . '/order-api-errors.log');
 
-// Headers CORS și JSON
 header("Access-Control-Allow-Origin: *");
 header("Content-Type: application/json; charset=UTF-8");
 header("Access-Control-Allow-Methods: POST, OPTIONS");
 header("Access-Control-Allow-Headers: Content-Type");
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit; }
 
-// Handle preflight OPTIONS (Raspuns instant)
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-    http_response_code(200);
-    exit;
-}
-
-// === PASUL 3: CONFIGURARE CONSTANTE ===
 require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/automation.php';
 
-// === PASUL 4: INCLUDE PHPMailer ===
-require __DIR__ . '/PHPMailer-master/src/Exception.php';
-require __DIR__ . '/PHPMailer-master/src/PHPMailer.php';
-require __DIR__ . '/PHPMailer-master/src/SMTP.php';
-
+if (file_exists(__DIR__ . '/PHPMailer-master/src/PHPMailer.php')) {
+    require __DIR__ . '/PHPMailer-master/src/Exception.php';
+    require __DIR__ . '/PHPMailer-master/src/PHPMailer.php';
+    require __DIR__ . '/PHPMailer-master/src/SMTP.php';
+}
 use PHPMailer\PHPMailer\PHPMailer;
-use PHPMailer\PHPMailer\Exception;
 
-// === PASUL 5: FUNCTII HELPER ===
-
-/**
- * Conectare MySQL cu PDO
- */
-function getDbConnection() {
-    try {
-        $dsn = "mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=utf8mb4";
-        $options = [
-            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-            PDO::ATTR_EMULATE_PREPARES => false,
-        ];
-        return new PDO($dsn, DB_USER, DB_PASS, $options);
-    } catch (PDOException $e) {
-        error_log("MySQL Error: " . $e->getMessage());
-        return null;
+if (!function_exists('logEvent')) {
+    function logEvent($type, $msg) {
+        $f = defined('LOG_ORDERS') ? LOG_ORDERS : __DIR__.'/logs/orders.log';
+        @mkdir(dirname($f), 0755, true);
+        file_put_contents($f, '['.date('Y-m-d H:i:s').'] ['.$type.'] '.$msg.PHP_EOL, FILE_APPEND);
     }
 }
 
-/**
- * Salvează comanda în MySQL
- */
 function saveOrderToDatabase($data) {
     $pdo = getDbConnection();
     if (!$pdo) return false;
-    
-    $productPrice = floatval($data['price']);
-    $finalTotal = $productPrice + SHIPPING_COST;
-    
-    $sql = "INSERT INTO orders (
-        full_name, 
-        phone, 
-        email, 
-        county, 
-        city, 
-        address_line, 
-        bundle, 
-        total_price, 
-        payment_method,
-        status,
-        created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NOW())";
-    
+    $shipping   = ($data['shippingMethod'] === 'easybox') ? floatval(SHIPPING_COST_EASYBOX) : floatval(SHIPPING_COST_GLS);
+    $finalTotal = floatval($data['price']) + $shipping;
+    $lockerId   = $data['lockerId'] ?? null;
+    $postalCode = $data['address']['postal_code'] ?? '';
+    $lockerDetails = $data['lockerDetails'] ?? null;
+    $addressLine   = $data['address']['line'] ?? '';
+    if ($data['shippingMethod'] === 'easybox' && $lockerDetails && strpos($lockerDetails,'|') !== false)
+        $addressLine = explode('|', $lockerDetails)[1];
     try {
-        $stmt = $pdo->prepare($sql);
-        $stmt->execute([
-            $data['fullName'],
-            $data['phone'],
-            $data['email'] ?: '',
-            $data['address']['county'],
-            $data['address']['city'],
-            $data['address']['line'],
-            $data['bundle'],
-            $finalTotal,
-            $data['paymentMethod']
-        ]);
-        
+        $s = $pdo->prepare("INSERT INTO orders (full_name,phone,email,county,city,address_line,postal_code,bundle,total_price,payment_method,shipping_method,easybox_locker_id,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'pending',NOW())");
+        $s->execute([$data['fullName'],$data['phone'],$data['email']?:'',$data['address']['county'],$data['address']['city'],$addressLine,$postalCode,$data['bundle'],$finalTotal,$data['paymentMethod'],$data['shippingMethod']??'gls',$lockerId]);
         return $pdo->lastInsertId();
-        
-    } catch (PDOException $e) {
-        error_log("MySQL Insert Error: " . $e->getMessage());
-        return false;
-    }
+    } catch (PDOException $e) { logEvent("INSERT_ERROR",$e->getMessage()); return false; }
 }
 
-/**
- * Configurare PHPMailer (Timeout redus la 5 secunde)
- */
 function getMailer() {
-    $mail = new PHPMailer(true);
-    try {
-        $mail->isSMTP();
-        $mail->Host       = SMTP_HOST;
-        $mail->SMTPAuth   = true;
-        $mail->Username   = SMTP_USER;
-        $mail->Password   = SMTP_PASS;
-        $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
-        $mail->Port       = SMTP_PORT;
-        $mail->CharSet    = 'UTF-8';
-        $mail->Timeout    = 5; // Redus de la 10 la 5 secunde
-        return $mail;
-    } catch (Exception $e) {
-        error_log("PHPMailer Setup Error: " . $e->getMessage());
-        return null;
-    }
+    $m = new PHPMailer(true);
+    $m->isSMTP(); $m->Host=SMTP_HOST; $m->SMTPAuth=true;
+    $m->Username=SMTP_USER; $m->Password=SMTP_PASS;
+    $m->SMTPSecure=PHPMailer::ENCRYPTION_STARTTLS;
+    $m->Port=intval(SMTP_PORT); $m->CharSet='UTF-8'; $m->Timeout=10;
+    return $m;
 }
 
-/**
- * Email către admin (HTML Original Complet)
- */
-function sendAdminEmail($data, $orderId) {
+function sendAdminEmail($data, $orderId, $shipping) {
     if (empty(SMTP_PASS)) return false;
-    
-    $mail = getMailer();
-    if (!$mail) return false;
-    
-    $prodPrice = floatval($data['price']);
-    $shipping = SHIPPING_COST;
-    $total = $prodPrice + $shipping;
-    
     try {
-        $mail->setFrom(FROM_EMAIL, FROM_NAME);
-        $mail->addReplyTo($data['email'] ?: FROM_EMAIL, $data['fullName']);
-        $mail->addAddress(ADMIN_EMAIL);
-        
-        $mail->Subject = "🛒 Comandă Nouă #{$orderId} - {$data['fullName']} - {$total} RON";
-        
-        $mail->isHTML(true);
-        $mail->Body = "
-
-<html>
-<body style='font-family: Arial, sans-serif; color: #333;'>
-    <div style='max-width: 600px; margin: 0 auto; padding: 20px; background: #f9f9f9;'>
-        
-        <div style='background: #eb2571; color: white; padding: 20px; text-align: center;'>
-            <h2>🛒 Comandă Nouă - Secretul Pisicii</h2>
-        </div>
-        
-        <div style='background: white; padding: 20px; margin-top: 10px;'>
-            
-            
-            <p><strong>ID Comandă:</strong> #{$orderId}</p>
-            <p><strong>Client:</strong> {$data['fullName']}</p>
-            <p><strong>Telefon:</strong> {$data['phone']}</p>
-            <p><strong>Email:</strong> {$data['email']}</p>
-            <hr>
-            <p><strong>Județ:</strong> {$data['address']['county']}</p>
-            <p><strong>Oraș:</strong> {$data['address']['city']}</p>
-            <p><strong>Adresă:</strong> {$data['address']['line']}</p>
-            <hr>
-            
-            <h3 style='margin-bottom:10px;'>Sumar Plată:</h3>
-            <table style='width:100%; border-collapse: collapse;'>
-                <tr>
-                    <td style='padding:5px 0;'>Pachet ({$data['bundle']} buc)</td>
-                    <td style='text-align:right;'>{$prodPrice} RON</td>
-                </tr>
-                <tr>
-                    <td style='padding:5px 0;'>Transport Curier GLS</td>
-                    <td style='text-align:right;'>{$shipping} RON</td>
-                </tr>
-                <tr style='border-top:1px solid #ccc; font-weight:bold;'>
-                    <td style='padding:10px 0;'>TOTAL</td>
-                    <td style='text-align:right; color:#eb2571;'>{$total} RON</td>
-                </tr>
-            </table>
-            <p style='margin-top:15px;'><strong>Metodă Plată:</strong> " . strtoupper($data['paymentMethod']) . "</p>
-            
-            <div style='text-align: center; margin-bottom: 20px; padding-bottom: 15px; border-bottom: 1px solid #eee;'>
-                <a href='" . ADMIN_URL . "' style='background-color: #2563eb; color: white; padding: 12px 24px; text-decoration: none; font-weight: bold; border-radius: 5px; display: inline-block;'>
-                    Mergi la Admin Dashboard 🚀
-                </a>
-            </div>
-        </div>
-    </div>
-</body>
-</html>
-";
-        
-        
-        $mail->send();
-        return true;
-        
-    } catch (Exception $e) {
-        error_log("Admin Email Error: " . $mail->ErrorInfo);
-        return false;
-    }
+        $m=$getMailer=getMailer(); $total=floatval($data['price'])+$shipping;
+        $method=($data['shippingMethod']==='easybox')?'EasyBox Locker':'GLS Curier';
+        $m->setFrom(FROM_EMAIL,'Comenzi Secretul Pisicii');
+        if (!empty($data['email'])) $m->addReplyTo($data['email'],$data['fullName']);
+        $m->addAddress(ADMIN_EMAIL);
+        $m->Subject="Comanda Noua #{$orderId} - {$total} RON";
+        $m->isHTML(true);
+        $m->Body="<div style='font-family:Arial;padding:20px;background:#f3f4f6;'><div style='background:#fff;padding:20px;border-radius:8px;'>
+            <h2 style='color:#eb2571;margin-top:0;'>Comanda Noua #{$orderId}</h2>
+            <p><b>Client:</b> {$data['fullName']}</p>
+            <p><b>Telefon:</b> <a href='tel:{$data['phone']}'>{$data['phone']}</a></p>
+            <p><b>Email:</b> {$data['email']}</p><hr>
+            <p><b>Livrare:</b> {$method}</p>".($data['lockerId']?"<p><b>Locker ID:</b> {$data['lockerId']}</p>":"")."
+            <p><b>Adresa:</b> {$data['address']['county']}, {$data['address']['city']}, {$data['address']['line']}</p><hr>
+            <p>Pachet: {$data['bundle']} buc | Transport: {$shipping} Lei</p>
+            <h3 style='color:#eb2571;'>TOTAL: {$total} Lei</h3>
+            <p><b>Plata:</b> ".strtoupper($data['paymentMethod'])."</p>
+        </div></div>";
+        $m->send(); return true;
+    } catch (Throwable $e) { logEvent("EMAIL_ADMIN_FAIL",$e->getMessage()); return false; }
 }
 
-/**
- * Email confirmare client (HTML Original Complet)
- */
-function sendClientEmail($data, $orderId) {
-    if (empty($data['email']) || !filter_var($data['email'], FILTER_VALIDATE_EMAIL)) {
-        return false;
-    }
-    
-    if (empty(SMTP_PASS)) return false;
-    
-    $mail = getMailer();
-    if (!$mail) return false;
-    
-    $prodPrice = floatval($data['price']);
-    $shipping = SHIPPING_COST;
-    $total = $prodPrice + $shipping;
-    
+function sendClientEmail($data, $orderId, $shipping) {
+    if (empty($data['email'])||empty(SMTP_PASS)) return false;
     try {
-        $mail->setFrom(FROM_EMAIL, FROM_NAME);
-        $mail->addReplyTo(FROM_EMAIL, FROM_NAME);
-        $mail->addAddress($data['email'], $data['fullName']);
-        
-        $mail->Subject = "Confirmare Comanda #" . $orderId . " - Secretul Pisicii";
-        
-        $plainText = "Buna {$data['fullName']},
-        Am primit comanda ta!
-        Total de plata: {$total} RON (Pachet {$prodPrice} + Transport {$shipping}).
-        Adresa: {$data['address']['county']}, {$data['address']['city']}, {$data['address']['line']}.
-        Te vom contacta curand.";
-
-        $mail->AltBody = $plainText;
-        
-        $mail->isHTML(true);
-        $mail->Body = "
-        <html>
-        <body style='font-family: Arial, sans-serif; color: #333;'>
-            <div style='max-width: 600px; margin: 0 auto;'>
-                <h2 style='color: #eb2571;'>Confirmare Comanda</h2>
-                <p>Buna <strong>{$data['fullName']}</strong>,</p>
-                <p>Am primit comanda ta cu succes! Mai jos ai detaliile.</p>
-                
-                <h3 style='color: #eb2571;'>Detalii Financiare:</h3>
-                <table style='width: 100%; border-collapse: collapse;'>
-                    <tr style='border-bottom: 1px solid #eee;'>
-                        <td style='padding: 8px 0;'><strong>Numar Comanda:</strong></td>
-                        <td style='padding: 8px 0;'>#{$orderId}</td>
-                    </tr>
-                    <tr style='border-bottom: 1px solid #eee;'>
-                        <td style='padding: 8px 0;'><strong>Pachet:</strong></td>
-                        <td style='padding: 8px 0;'>{$data['bundle']} bucăți ({$prodPrice} Lei)</td>
-                    </tr>
-                    <tr style='border-bottom: 1px solid #eee;'>
-                        <td style='padding: 8px 0;'><strong>Transport GLS:</strong></td>
-                        <td style='padding: 8px 0;'>{$shipping} Lei</td>
-                    </tr>
-                    <tr style='border-bottom: 1px solid #eee;'>
-                        <td style='padding: 8px 0;'><strong>TOTAL DE PLATĂ:</strong></td>
-                        <td style='padding: 8px 0;'><strong style='color: #eb2571;'>{$total} RON</strong></td>
-                    </tr>
-                </table>
-                
-                <h3 style='color: #eb2571;'>Adresa Livrare:</h3>
-                <p>{$data['address']['county']}, {$data['address']['city']}<br>
-                {$data['address']['line']}</p>
-                
-                <p><strong>Telefon:</strong> {$data['phone']}</p>
-                
-                <div style='margin-top: 30px; padding: 15px; background: #f9f9f9; border-left: 4px solid #eb2571;'>
-                    <p style='margin: 0;'><strong>Te vom contacta in curand pentru confirmare!</strong></p>
+        $m=getMailer(); $total=floatval($data['price'])+$shipping;
+        $method=($data['shippingMethod']==='easybox')?'EasyBox Locker':'GLS Curier';
+        $m->setFrom(FROM_EMAIL,'Secretul Pisicii');
+        $m->addAddress($data['email'],$data['fullName']);
+        $m->Subject="Confirmare Comanda #{$orderId} - Secretul Pisicii";
+        $m->isHTML(true);
+        $m->Body="<div style='font-family:Arial;max-width:600px;margin:0 auto;'>
+            <div style='background:#eb2571;padding:20px;text-align:center;'><h1 style='color:#fff;margin:0;'>Multumim!</h1></div>
+            <div style='padding:20px;border:1px solid #eee;'>
+                <p>Salut <b>{$data['fullName']}</b>,</p><p>Comanda ta a fost inregistrata.</p>
+                <div style='background:#f9fafb;padding:15px;border-radius:8px;margin:20px 0;'>
+                    <h3 style='margin-top:0;'>Comanda #{$orderId}</h3>
+                    <table style='width:100%;'>
+                        <tr><td>Pachet:</td><td style='text-align:right;font-weight:bold;'>{$data['bundle']} buc</td></tr>
+                        <tr><td>Produse:</td><td style='text-align:right;'>".floatval($data['price'])." Lei</td></tr>
+                        <tr><td>Livrare ({$method}):</td><td style='text-align:right;'>{$shipping} Lei</td></tr>
+                        <tr style='border-top:1px solid #ddd;'><td style='padding-top:10px;font-weight:bold;'>TOTAL:</td>
+                        <td style='text-align:right;font-weight:bold;color:#eb2571;font-size:18px;'>{$total} Lei</td></tr>
+                    </table>
                 </div>
-                
-                <p style='text-align: center; color: #666; margin-top: 40px;'>
-                    Multumim,<br>
-                    <strong>Echipa Secretul Pisicii</strong>
-                </p>
-            </div>
-        </body>
-        </html>
-        ";
-        
-        $mail->send();
-        return true;
-        
-    } catch (Exception $e) {
-        error_log("Client Email Error: " . $mail->ErrorInfo);
-        return false;
-    }
+                <p><b>Adresa:</b> {$data['address']['line']}, {$data['address']['city']}, {$data['address']['county']}</p>
+                <p style='font-size:14px;color:#666;'>Vei primi SMS de la curier in ziua livrarii.</p>
+            </div></div>";
+        $m->send(); return true;
+    } catch (Throwable $e) { logEvent("EMAIL_CLIENT_FAIL",$e->getMessage()); return false; }
 }
 
-// ==========================================
-//   MAIN LOGIC - EXECUTIE OPTIMIZATA
-// ==========================================
+// --- INPUT ---
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') { echo json_encode(['success'=>false,'message'=>'Metoda invalida.']); exit; }
+$data = json_decode(file_get_contents('php://input'), true);
+if (!$data || empty($data['fullName']) || empty($data['phone'])) { echo json_encode(['success'=>false,'message'=>'Date incomplete.']); exit; }
 
-// 1. Verificare metodă HTTP
-if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-    echo json_encode(['success' => false, 'message' => 'Metodă HTTP invalidă.']);
-    exit;
-}
-
-// 2. Citire și validare date JSON
-$input = file_get_contents('php://input');
-$data = json_decode($input, true);
-
-if (!$data) {
-    echo json_encode(['success' => false, 'message' => 'Date invalide. Verifică formatul JSON.']);
-    exit;
-}
-
-// 3. Validare câmpuri obligatorii
-$required = ['fullName', 'phone', 'bundle', 'price', 'paymentMethod'];
-foreach ($required as $field) {
-    if (empty($data[$field])) {
-        echo json_encode(['success' => false, 'message' => "Câmpul '$field' este obligatoriu."]);
-        exit;
-    }
-}
-
-// 4. Validare adresă
-if (empty($data['address']['county']) || empty($data['address']['city']) || empty($data['address']['line'])) {
-    echo json_encode(['success' => false, 'message' => 'Adresa completă este obligatorie.']);
-    exit;
-}
-
-// 5. Validare telefon
-if (!preg_match('/^[0-9\s\+\-\(\)]{10,}$/', $data['phone'])) {
-    echo json_encode(['success' => false, 'message' => 'Număr de telefon invalid.']);
-    exit;
-}
-
-// 6. Validare email (daca e furnizat)
-if (!empty($data['email']) && !filter_var($data['email'], FILTER_VALIDATE_EMAIL)) {
-    echo json_encode(['success' => false, 'message' => 'Adresa de email este invalidă.']);
-    exit;
-}
-
-// 7. Sanitizare date
-$data['fullName'] = htmlspecialchars(trim($data['fullName']), ENT_QUOTES, 'UTF-8');
-$data['phone'] = htmlspecialchars(trim($data['phone']), ENT_QUOTES, 'UTF-8');
-$data['email'] = htmlspecialchars(trim($data['email']), ENT_QUOTES, 'UTF-8');
-$data['address']['county'] = htmlspecialchars(trim($data['address']['county']), ENT_QUOTES, 'UTF-8');
-$data['address']['city'] = htmlspecialchars(trim($data['address']['city']), ENT_QUOTES, 'UTF-8');
-$data['address']['line'] = htmlspecialchars(trim($data['address']['line']), ENT_QUOTES, 'UTF-8');
-
-// 8. SALVARE ÎN BAZA DE DATE
+// --- SAVE ---
 $orderId = saveOrderToDatabase($data);
+if (!$orderId) { echo json_encode(['success'=>false,'message'=>'Eroare interna. Incearca din nou.']); exit; }
 
-if (!$orderId) {
-    echo json_encode(['success' => false, 'message' => 'Eroare la salvarea comenzii. Baza de date nu raspunde.']);
-    exit;
-}
+$shipping    = ($data['shippingMethod']==='easybox') ? floatval(SHIPPING_COST_EASYBOX) : floatval(SHIPPING_COST_GLS);
+$totalAmount = floatval($data['price']) + $shipping;
+logEvent("INFO","Comanda #{$orderId} salvata | {$data['paymentMethod']} | {$totalAmount} RON");
 
-// ==========================================
-//  PUNCT CRITIC - TRIMITERE RASPUNS INSTANT
-// ==========================================
-
-// Construim raspunsul JSON
-$response = [
-    'success' => true,
-    'message' => 'Comanda ta a fost înregistrată cu succes! Te vom contacta în curând.',
-    'data' => ['orderId' => $orderId],
-    'timestamp' => date('Y-m-d H:i:s')
-];
-
-$jsonResponse = json_encode($response, JSON_UNESCAPED_UNICODE);
-$responseLength = strlen($jsonResponse);
-
-// Trimitem header-ele in ordinea EXACTA pentru inchidere rapida
-header("Content-Length: {$responseLength}");
-header("Connection: close");
-header("Content-Encoding: none");
-
-// Trimitem raspunsul
-echo $jsonResponse;
-
-// Fortam trimiterea catre client
-if (function_exists('ob_flush')) {
-    @ob_flush();
-}
-flush();
-
-// ACTIVAM EXECUTIA IN BACKGROUND (Clientul primeste raspunsul AICI!)
-if (function_exists('fastcgi_finish_request')) {
-    fastcgi_finish_request();
-}
-
-// ==========================================
-//  BACKGROUND PROCESS - TRIMITERE EMAIL-URI
-//  (Clientul NU mai asteapta asta!)
-// ==========================================
-
-// Trimitem email-urile in background fara sa afecteze viteza raspunsului
-try {
-    sendAdminEmail($data, $orderId);
-} catch (Exception $e) {
-    error_log("Background Admin Email Error: " . $e->getMessage());
-}
-
-try {
-    sendClientEmail($data, $orderId);
-} catch (Exception $e) {
-    error_log("Background Client Email Error: " . $e->getMessage());
-}
-
-// Gata! Scriptul se termina aici.
-// === INTEGRARE OBLIO (AUTO SEND) ===
-if ($orderId) {
+// --- CARD: identic oclar /api/create-netopia-session ---
+if ($data['paymentMethod'] === 'card') {
     try {
-        if (!function_exists('sendOrderToOblio')) {
-            require_once __DIR__ . '/oblio_functions.php';
-        }
-        
-        $orderDataForOblio = [
-            'full_name'    => $data['fullName'],
-            'email'        => $data['email'],
-            'phone'        => $data['phone'],
-            'address_line' => $data['address']['line'],
-            'city'         => $data['address']['city'],
-            'county'       => $data['address']['county'],
-            'total_price'  => floatval($data['price']) + SHIPPING_COST,
-            'payment_method' => $data['paymentMethod'],
-            'bundle'       => $data['bundle']
-        ];
-
-        sendOrderToOblio($orderDataForOblio, $orderId, getDbConnection());
-
-    } catch (Exception $e) {
-        error_log("OBLIO ERROR: " . $e->getMessage());
+        require_once __DIR__ . '/netopia_functions.php';
+        $parts  = explode(' ', trim($data['fullName']), 2);
+        $result = createPaymentSession([
+            'orderId'   => $orderId, 'amount'    => $totalAmount,
+            'email'     => $data['email']  ?? '', 'phone'     => $data['phone']  ?? '0700000000',
+            'firstName' => $parts[0] ?? 'Client', 'lastName'  => $parts[1] ?? 'Necunoscut',
+            'address'   => ['city'   => $data['address']['city'] ?? 'Bucuresti', 'county' => $data['address']['county'] ?? 'Bucuresti', 'line' => $data['address']['line'] ?? ''],
+        ]);
+        logEvent("INFO","[Netopia] paymentUrl obtinut #{$orderId}");
+        echo json_encode(['success'=>true,'orderId'=>$orderId,'paymentUrl'=>$result['paymentUrl']]);
+    } catch (Throwable $e) {
+        logEvent("ERROR","Netopia Init esec #{$orderId}: ".$e->getMessage());
+        try { $pdo=getDbConnection(); if($pdo) $pdo->prepare("DELETE FROM orders WHERE id=? AND payment_method='card' AND status='pending'")->execute([$orderId]); } catch(Throwable $x){}
+        echo json_encode(['success'=>false,'message'=>'Eroare initiere plata: '.$e->getMessage()]);
     }
-}
-// === INTEGRARE E-COLET (AUTO AWB) ===
-if ($orderId) {
-    try {
-        if (!function_exists('generateEcoletAWB')) {
-            require_once __DIR__ . '/ecolet_functions.php';
-        }
-
-        $orderDataForEcolet = [
-            'full_name'    => $data['fullName'],
-            'email'        => $data['email'],
-            'phone'        => $data['phone'],
-            'address_line' => $data['address']['line'],
-            'city'         => $data['address']['city'],
-            'county'       => $data['address']['county'],
-            'total_price'  => floatval($data['price']) + SHIPPING_COST,
-            'bundle'       => $data['bundle']
-        ];
-
-        $awbResult = generateEcoletAWB($orderDataForEcolet, $orderId, getDbConnection());
-        
-        if ($awbResult['success']) {
-            error_log("ECOLET SUCCESS: " . $awbResult['message']);
-        } else {
-            error_log("ECOLET ERROR Comanda #$orderId: " . $awbResult['message']);
-        }
-
-    } catch (Exception $e) {
-        error_log("ECOLET EXCEPTION: " . $e->getMessage());
-    }
+    exit; // STOP — email+auto vin din payment-webhook.php dupa IPN
 }
 
+// --- RAMBURS: raspuns rapid + background ---
+ob_start();
+echo json_encode(['success'=>true,'message'=>'Comanda a fost inregistrata!','data'=>['orderId'=>$orderId,'total'=>$totalAmount,'paymentMethod'=>$data['paymentMethod']]]);
+$size=ob_get_length();
+header("Content-Encoding: none"); header("Content-Length: {$size}"); header("Connection: close");
+ob_end_flush(); flush();
+if (function_exists('fastcgi_finish_request')) fastcgi_finish_request();
 
+// BACKGROUND — identic oclar ramburs_create
+logEvent("INFO","Background ramburs #{$orderId}");
+try { sendAdminEmail($data,$orderId,$shipping);  logEvent("INFO","Email Admin #{$orderId}"); } catch(Throwable $e){logEvent("ERROR","Email admin: ".$e->getMessage());}
+try { sendClientEmail($data,$orderId,$shipping); logEvent("INFO","Email Client #{$orderId}"); } catch(Throwable $e){logEvent("ERROR","Email client: ".$e->getMessage());}
+runAutomations($orderId, 'ramburs_create');
+logEvent("INFO","Procesare completa #{$orderId}");
 exit;
 ?>

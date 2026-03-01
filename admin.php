@@ -1,478 +1,354 @@
 <?php
-session_start(); // OBLIGATORIU: Trebuie sa fie prima linie
+session_start();
 
-// ==============================
-//  VERIFICARE SECURITATE
-// ==============================
-// FIX: Am sters litera 'A' care cauza eroarea fatala
-if (!isset($_SESSION['admin_logged_in']) || 
-    $_SESSION['admin_logged_in'] !== true || 
-    $_SESSION['user_agent'] !== $_SERVER['HTTP_USER_AGENT']) {
-    
-    session_destroy();
+// 1. SECURITATE
+if (!isset($_SESSION['admin_logged_in']) || $_SESSION['admin_logged_in'] !== true) {
     header('Location: login.php');
     exit;
 }
 
-// Includem fisierele necesare
-require_once 'db_connect.php';
-require_once 'oblio_functions.php';
+require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/automation.php';
 
-$pdo = getDbConnection();
+// Includem funcțiile doar dacă există
+if (file_exists(__DIR__ . '/oblio_functions.php')) require_once __DIR__ . '/oblio_functions.php';
+if (file_exists(__DIR__ . '/ecolet_functions.php')) require_once __DIR__ . '/ecolet_functions.php';
 
-// ==============================
-//  BACKEND ACTIONS (AJAX)
-// ==============================
+try {
+    $dsn = "mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=utf8mb4";
+    $pdo = new PDO($dsn, DB_USER, DB_PASS, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+} catch (PDOException $e) {
+    die("Eroare DB: " . $e->getMessage());
+}
 
-// Functie helper pentru a trimite JSON curat
-function sendJsonResponse($data) {
-    // Curatam orice output anterior (spatii, warning-uri, HTML)
-    if (ob_get_length()) ob_clean();
+// 2. ACTIUNI BACKEND (AJAX)
+if (isset($_POST['action'])) {
     header('Content-Type: application/json');
-    echo json_encode($data);
-    exit; // Oprim executia scriptului aici
-}
+    $response = ['success' => false, 'message' => 'Actiune necunoscuta'];
 
-// 1. UPDATE COMANDA (EDIT)
-if (isset($_POST['action']) && $_POST['action'] == 'update_order') {
     try {
-        $sql = "UPDATE orders SET full_name=?, phone=?, email=?, city=?, county=?, address_line=? WHERE id=?";
-        $stmt = $pdo->prepare($sql);
-        $stmt->execute([
-            $_POST['full_name'],
-            $_POST['phone'],
-            $_POST['email'],
-            $_POST['city'],
-            $_POST['county'],
-            $_POST['address_line'],
-            $_POST['order_id']
-        ]);
-        sendJsonResponse(['success' => true]);
-    } catch (Exception $e) {
-        sendJsonResponse(['success' => false, 'message' => $e->getMessage()]);
-    }
-}
-
-// 2. TOGGLE AUTO-SEND
-if (isset($_POST['toggle_auto'])) {
-    try {
-        $newState = $_POST['state'] === 'true' ? '1' : '0';
-        $check = $pdo->query("SELECT count(*) FROM settings WHERE setting_key = 'auto_oblio'")->fetchColumn();
-        if($check == 0) {
-            $pdo->prepare("INSERT INTO settings (setting_key, setting_value) VALUES ('auto_oblio', ?)")->execute([$newState]);
-        } else {
-            $pdo->prepare("UPDATE settings SET setting_value = ? WHERE setting_key = 'auto_oblio'")->execute([$newState]);
+        if ($_POST['action'] == 'update_order') {
+            // Editare comanda
+            $sql = "UPDATE orders SET full_name=?, phone=?, email=?, city=?, county=?, address_line=? WHERE id=?";
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute([
+                $_POST['full_name'], $_POST['phone'], $_POST['email'], 
+                $_POST['city'], $_POST['county'], $_POST['address_line'], 
+                $_POST['order_id']
+            ]);
+            $response = ['success' => true];
         }
-        sendJsonResponse(['success' => true]);
+        elseif ($_POST['action'] == 'generate_invoice') {
+            // Generare Factura Oblio
+            if (!function_exists('sendToOblio')) throw new Exception("Functia Oblio lipseste.");
+            $msg = sendToOblio($_POST['order_id']);
+            $response = ['success' => true, 'message' => $msg];
+        }
+        elseif ($_POST['action'] == 'generate_awb') {
+            // Generare AWB Ecolet
+            if (!function_exists('generateEcoletAWB')) throw new Exception("Functia Ecolet lipseste.");
+            $msg = generateEcoletAWB($_POST['order_id']);
+            $response = ['success' => true, 'message' => $msg];
+        }
+        elseif ($_POST['action'] == 'get_settings') {
+            // Identic oclar GET /api/admin/settings
+            $settings = getAllAutomationSettings();
+            $response = ['success' => true, 'settings' => $settings];
+        }
+        elseif ($_POST['action'] == 'update_setting') {
+            // Identic oclar POST /api/admin/settings — UPSERT
+            $key   = $_POST['key']   ?? '';
+            $value = ($_POST['value'] === 'true' || $_POST['value'] === '1');
+            updateAutomationSetting($key, $value);
+            $response = ['success' => true];
+        }
     } catch (Exception $e) {
-        sendJsonResponse(['success' => false, 'message' => $e->getMessage()]);
-    }
-}
-
-// 3. EMITERE FACTURA (Aici era problema cu raspunsul JSON)
-if (isset($_POST['action']) && $_POST['action'] == 'manual_invoice') {
-    $orderId = $_POST['order_id'];
-    
-    // Verificam daca comanda exista
-    $stmt = $pdo->prepare("SELECT * FROM orders WHERE id = ?");
-    $stmt->execute([$orderId]);
-    $order = $stmt->fetch();
-
-    if (!$order) {
-        sendJsonResponse(['success' => false, 'message' => 'Comanda nu exista']);
+        $response = ['success' => false, 'message' => $e->getMessage()];
     }
 
-    // Verificam daca e deja emisa (security check)
-    if ($order['oblio_status'] == 1) {
-        sendJsonResponse(['success' => true, 'message' => 'Deja emisa']);
-    }
-
-    // Pregatim datele pentru Oblio
-    $orderDataForOblio = [
-        'full_name' => $order['full_name'],
-        'email' => $order['email'],
-        'phone' => $order['phone'],
-        'address_line' => $order['address_line'],
-        'city' => $order['city'],
-        'county' => $order['county'],
-        'total_price' => $order['total_price'], 
-        'payment_method' => $order['payment_method'],
-        'bundle' => $order['bundle']
-    ];
-
-    // Apelam functia din oblio_functions.php
-    $res = sendOrderToOblio($orderDataForOblio, $orderId, $pdo);
-    
-    // Trimitem raspunsul curat inapoi la JS
-    sendJsonResponse($res);
+    echo json_encode($response);
+    exit;
 }
 
-// ==============================
-//  AFISARE & FILTRE (HTML)
-// ==============================
+// 3. AFISARE TABEL
+$sql = "SELECT * FROM orders ORDER BY created_at DESC LIMIT 100";
+$orders = $pdo->query($sql)->fetchAll(PDO::FETCH_ASSOC);
 
-// Citire stare Auto
-$stmt = $pdo->query("SELECT setting_value FROM settings WHERE setting_key = 'auto_oblio'");
-$res = $stmt->fetch();
-$autoEnabled = ($res && $res['setting_value'] == '1');
-
-// Filtre Date
-$startDate = isset($_GET['start_date']) ? $_GET['start_date'] : '';
-$endDate = isset($_GET['end_date']) ? $_GET['end_date'] : '';
-
-$whereClause = "";
-$params = [];
-if ($startDate && $endDate) {
-    $whereClause = "WHERE DATE(created_at) >= ? AND DATE(created_at) <= ?";
-    $params = [$startDate, $endDate];
+// Statistici
+$pendingInv = 0;
+$pendingAWB = 0;
+foreach($orders as $o) {
+    if ($o['oblio_status'] == 0) $pendingInv++;
+    if (empty($o['awb_number'])) $pendingAWB++;
 }
-
-// Query Principal
-$sql = "SELECT * FROM orders $whereClause ORDER BY created_at DESC LIMIT 150";
-$stmt = $pdo->prepare($sql);
-$stmt->execute($params);
-$orders = $stmt->fetchAll();
-
-// Statistici rapide
-$ordersWithoutInvoice = 0;
-foreach($orders as $o) if($o['oblio_status'] == 0) $ordersWithoutInvoice++;
 ?>
-
 <!DOCTYPE html>
 <html lang="ro">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Admin Dashboard V4</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin - Secretul Pisicii</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
     <style>
-        body { padding-bottom: 100px; }
-        .slide-up { transform: translateY(0%); }
+        body { background: #f3f4f6; font-family: sans-serif; padding-bottom: 100px; }
+        .slide-up { transform: translateY(0); }
         .slide-down { transform: translateY(150%); }
-        .selected-row { background-color: #eff6ff !important; }
-        .selected-row td:first-child { border-left: 4px solid #2563eb; }
-        .table-container { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-        input:disabled { cursor: not-allowed; opacity: 0.3; }
+        .selected-row { background-color: #e0f2fe !important; }
+        .badge { padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; text-transform: uppercase; }
+        .badge-green { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
+        .badge-red { background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }
+        .badge-blue { background: #dbeafe; color: #1e40af; border: 1px solid #bfdbfe; }
     </style>
 </head>
-<body class="bg-gray-100 min-h-screen font-sans text-gray-800">
+<body>
 
-    <div class="max-w-7xl mx-auto p-2 md:p-6">
-        
-        <div class="bg-white p-4 rounded-xl shadow-sm mb-4 flex flex-col md:flex-row justify-between items-center gap-4">
-            
-            <div class="flex items-center gap-4 w-full md:w-auto justify-between">
-                <div>
-                    <h1 class="text-xl font-bold text-gray-900">Comenzi</h1>
-                    <p class="text-xs text-gray-500">Neemise: <b class="text-red-500"><?php echo $ordersWithoutInvoice; ?></b></p>
-                </div>
-                <div class="flex items-center gap-2 bg-gray-50 px-3 py-1 rounded-lg border">
-                    <span class="text-[10px] font-bold uppercase text-gray-400">Auto</span>
-                    <label class="relative inline-flex items-center cursor-pointer">
-                        <input type="checkbox" id="autoToggle" class="sr-only peer" <?php echo $autoEnabled ? 'checked' : ''; ?>>
-                        <div class="w-9 h-5 bg-gray-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-green-500"></div>
-                    </label>
-                </div>
+<div class="max-w-[95%] mx-auto p-4">
+    <div class="bg-white p-4 rounded-xl shadow mb-6 flex justify-between items-center">
+        <div>
+            <h1 class="text-2xl font-bold text-gray-800">Comenzi</h1>
+            <div class="text-xs text-gray-500 flex gap-3 mt-1">
+                <span>Fără Factură: <b class="text-red-500"><?php echo $pendingInv; ?></b></span>
+                <span>Fără AWB: <b class="text-orange-500"><?php echo $pendingAWB; ?></b></span>
             </div>
-
-            <form class="flex gap-2 items-center bg-gray-50 p-2 rounded-lg w-full md:w-auto overflow-x-auto">
-                <input type="date" name="start_date" value="<?php echo $startDate; ?>" class="border rounded p-1 text-sm bg-white">
-                <span class="text-gray-400">-</span>
-                <input type="date" name="end_date" value="<?php echo $endDate; ?>" class="border rounded p-1 text-sm bg-white">
-                <button type="submit" class="bg-blue-600 text-white px-3 py-1 rounded text-sm font-bold shadow">Caută</button>
-                <?php if($startDate): ?>
-                    <a href="admin.php" class="text-red-500 text-sm font-bold px-2 hover:underline whitespace-nowrap">Șterge Filtre</a>
-                <?php endif; ?>
-            </form>
         </div>
-
-        <div class="bg-white rounded-xl shadow overflow-hidden table-container">
-            <table class="w-full text-left border-collapse min-w-[800px]"> 
-                <thead class="bg-gray-800 text-white text-sm uppercase">
-                    <tr>
-                        <th class="p-3 w-10 text-center"><input type="checkbox" id="selectAll" class="cursor-pointer transform scale-125"></th>
-                        <th class="p-3">Data / ID</th>
-                        <th class="p-3">Client (Nume, Tel, Email)</th>
-                        <th class="p-3">Adresa</th>
-                        <th class="p-3">Total</th>
-                        <th class="p-3">Status</th>
-                        <th class="p-3 text-right">Acțiuni</th>
-                    </tr>
-                </thead>
-                <tbody class="text-gray-700 divide-y divide-gray-100 text-sm">
-                    <?php if(empty($orders)): ?>
-                        <tr><td colspan="7" class="p-8 text-center text-gray-400">Nu sunt comenzi.</td></tr>
-                    <?php endif; ?>
-
-                    <?php foreach($orders as $o): ?>
-                        <?php $isSent = ($o['oblio_status'] == 1); ?>
-                        <tr class="hover:bg-gray-50 transition <?php echo $isSent ? '' : 'cursor-pointer row-clickable'; ?>" 
-                            data-id="<?php echo $o['id']; ?>"
-                            onclick="toggleRow(this, <?php echo $o['id']; ?>, <?php echo $isSent ? 'true' : 'false'; ?>)">
-                            
-                            <td class="p-3 text-center" onclick="event.stopPropagation()">
-                                <input type="checkbox" class="order-check transform scale-125" 
-                                       value="<?php echo $o['id']; ?>"
-                                       <?php echo $isSent ? 'disabled' : ''; ?>>
-                            </td>
-
-                            <td class="p-3">
-                                <div class="font-bold">#<?php echo $o['id']; ?></div>
-                                <div class="text-xs text-gray-500"><?php echo date('d.m.Y', strtotime($o['created_at'])); ?></div>
-                                <div class="text-xs text-gray-400"><?php echo date('H:i', strtotime($o['created_at'])); ?></div>
-                            </td>
-
-                            <td class="p-3">
-                                <div class="font-bold text-gray-900"><?php echo $o['full_name']; ?></div>
-                                <div class="text-xs text-blue-600"><?php echo $o['phone']; ?></div>
-                                <div class="text-xs text-gray-500"><?php echo $o['email']; ?></div>
-                            </td>
-
-                            <td class="p-3 max-w-[200px]">
-                                <div class="font-semibold text-xs"><?php echo $o['city']; ?>, <?php echo $o['county']; ?></div>
-                                <div class="text-xs text-gray-400 truncate"><?php echo $o['address_line']; ?></div>
-                            </td>
-
-                            <td class="p-3 font-bold">
-                                <?php echo $o['total_price']; ?> RON
-                                <div class="text-[10px] font-normal text-gray-400 uppercase"><?php echo $o['payment_method']; ?></div>
-                            </td>
-
-                            <td class="p-3" id="status-<?php echo $o['id']; ?>">
-                                <?php if($isSent): ?>
-                                    <span class="bg-green-100 text-green-700 px-2 py-1 rounded text-xs font-bold inline-flex items-center gap-1">
-                                        ✅ EMISĂ
-                                    </span>
-                                <?php else: ?>
-                                    <span class="bg-red-50 text-red-600 px-2 py-1 rounded text-xs font-bold">
-                                        ⏳ PENDING
-                                    </span>
-                                <?php endif; ?>
-                            </td>
-
-                            <td class="p-3 text-right" onclick="event.stopPropagation()">
-                                <div class="flex justify-end gap-2">
-                                    <?php if(!$isSent): ?>
-                                        <button onclick="openEditModal(<?php echo htmlspecialchars(json_encode($o)); ?>)" 
-                                                class="text-gray-500 hover:text-blue-600 bg-gray-100 hover:bg-blue-50 px-2 py-1 rounded border">
-                                            ✏️ Edit
-                                        </button>
-                                    <?php else: ?>
-                                        <a href="<?php echo $o['oblio_link']; ?>" target="_blank" class="bg-green-600 text-white px-3 py-1 rounded text-xs font-bold shadow hover:bg-green-700">
-                                            PDF
-                                        </a>
-                                    <?php endif; ?>
-                                </div>
-                            </td>
-                        </tr>
-                    <?php endforeach; ?>
-                </tbody>
-            </table>
-        </div>
+        <a href="logout.php" class="text-red-500 hover:underline text-sm">Deconectare</a>
     </div>
 
-    <div id="actionBar" class="fixed bottom-6 left-4 right-4 md:left-auto md:right-6 md:w-96 bg-gray-900/95 backdrop-blur text-white p-4 rounded-2xl shadow-2xl transform slide-down transition-transform duration-300 z-40 flex justify-between items-center border border-gray-700">
-        <div class="flex flex-col">
-            <span class="text-xs text-gray-400 uppercase tracking-wide">Selectate</span>
-            <span class="font-bold text-xl"><span id="selectedCount">0</span> <span class="text-sm font-normal text-gray-400">comenzi</span></span>
-        </div>
-        
-        <button onclick="processBulk()" id="btnBulk" class="bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white px-6 py-3 rounded-xl font-bold shadow-lg flex items-center gap-2 transition active:scale-95">
-            <span id="bulkIcon" class="text-lg">🚀</span> 
-            <span id="bulkText">Trimite Tot</span>
-        </button>
-    </div>
-
-    <div id="editModal" class="fixed inset-0 bg-black/50 hidden z-50 flex items-center justify-center p-4">
-        <div class="bg-white rounded-xl shadow-2xl w-full max-w-md p-6 transform transition-all scale-100">
-            <h2 class="text-xl font-bold mb-4 text-gray-800">✏️ Editează Comanda <span id="modalOrderId" class="text-blue-600"></span></h2>
-            
-            <form id="editForm" class="space-y-3">
-                <input type="hidden" id="edit_id" name="order_id">
-                <input type="hidden" name="action" value="update_order">
-                
-                <div>
-                    <label class="text-xs font-bold text-gray-500">Nume Client</label>
-                    <input type="text" id="edit_name" name="full_name" class="w-full border rounded p-2 focus:ring-2 focus:ring-blue-500 outline-none">
-                </div>
-                
-                <div class="grid grid-cols-2 gap-2">
-                    <div>
-                        <label class="text-xs font-bold text-gray-500">Telefon</label>
-                        <input type="text" id="edit_phone" name="phone" class="w-full border rounded p-2">
-                    </div>
-                    <div>
-                        <label class="text-xs font-bold text-gray-500">Email</label>
-                        <input type="text" id="edit_email" name="email" class="w-full border rounded p-2">
-                    </div>
-                </div>
-
-                <div class="grid grid-cols-2 gap-2">
-                    <div>
-                        <label class="text-xs font-bold text-gray-500">Județ</label>
-                        <input type="text" id="edit_county" name="county" class="w-full border rounded p-2">
-                    </div>
-                    <div>
-                        <label class="text-xs font-bold text-gray-500">Oraș</label>
-                        <input type="text" id="edit_city" name="city" class="w-full border rounded p-2">
-                    </div>
-                </div>
-
-                <div>
-                    <label class="text-xs font-bold text-gray-500">Adresă Stradă</label>
-                    <textarea id="edit_address" name="address_line" rows="2" class="w-full border rounded p-2"></textarea>
-                </div>
-
-                <div class="flex gap-3 mt-6">
-                    <button type="button" onclick="$('#editModal').addClass('hidden')" class="flex-1 bg-gray-200 text-gray-700 py-2 rounded font-bold">Anulează</button>
-                    <button type="submit" class="flex-1 bg-blue-600 text-white py-2 rounded font-bold hover:bg-blue-700">Salvează</button>
-                </div>
-            </form>
-        </div>
-    </div>
-
-    <script>
-        const actionBar = document.getElementById('actionBar');
-        const countSpan = document.getElementById('selectedCount');
-
-        // Helper sigur pentru parsare JSON
-        function parseResponse(res) {
-            if (typeof res === 'object') return res;
-            try {
-                return JSON.parse(res);
-            } catch (e) {
-                console.error("Eroare parsare:", res);
-                return { success: false, message: 'Raspuns invalid de la server' };
-            }
-        }
-
-        // 1. SELECTIE RANDURI
-        function toggleRow(row, id, isSent) {
-            if(isSent) return;
-
-            let checkbox = $(row).find('.order-check');
-            let isChecked = checkbox.prop('checked');
-            
-            checkbox.prop('checked', !isChecked);
-            
-            if(!isChecked) {
-                $(row).addClass('selected-row');
-            } else {
-                $(row).removeClass('selected-row');
-            }
-            updateUI();
-        }
-
-        function updateUI() {
-            let checked = $('.order-check:checked');
-            countSpan.innerText = checked.length;
-            
-            if(checked.length > 0) {
-                actionBar.classList.remove('slide-down');
-                actionBar.classList.add('slide-up');
-            } else {
-                actionBar.classList.add('slide-down');
-                actionBar.classList.remove('slide-up');
-            }
-        }
-
-        // Select All
-        $('#selectAll').change(function() {
-            let state = this.checked;
-            $('.order-check:not(:disabled)').each(function() {
-                $(this).prop('checked', state);
-                let row = $(this).closest('tr');
-                if(state) row.addClass('selected-row');
-                else row.removeClass('selected-row');
-            });
-            updateUI();
-        });
-
-        // 2. MODAL EDITARE
-        function openEditModal(data) {
-            $('#edit_id').val(data.id);
-            $('#modalOrderId').text('#' + data.id);
-            $('#edit_name').val(data.full_name);
-            $('#edit_phone').val(data.phone);
-            $('#edit_email').val(data.email);
-            $('#edit_county').val(data.county);
-            $('#edit_city').val(data.city);
-            $('#edit_address').val(data.address_line);
-            
-            $('#editModal').removeClass('hidden');
-        }
-
-        // Submit Edit Form - REPARAT cu parseResponse
-        $('#editForm').submit(function(e) {
-            e.preventDefault();
-            let formData = $(this).serialize();
-            
-            $.post('admin.php', formData, function(res) {
-                let data = parseResponse(res);
-                if(data.success) {
-                    alert('Date actualizate!');
-                    location.reload();
-                } else {
-                    alert('Eroare: ' + data.message);
-                }
-            });
-        });
-
-        // 3. BULK PROCESS - REPARAT cu parseResponse
-        async function processBulk() {
-            let selected = $('.order-check:checked');
-            if(selected.length === 0) return;
-
-            if(!confirm(`Sigur vrei să emiti ${selected.length} facturi?`)) return;
-
-            let btn = document.getElementById('btnBulk');
-            let txt = document.getElementById('bulkText');
-            let icon = document.getElementById('bulkIcon');
-            
-            btn.classList.add('opacity-75', 'cursor-not-allowed');
-            icon.innerText = '⏳';
-
-            let total = selected.length;
-            let success = 0;
-
-            for (let i = 0; i < total; i++) {
-                let checkbox = selected[i];
-                let row = $(checkbox).closest('tr');
-                let id = $(checkbox).val();
-
-                txt.innerText = `Se trimite ${i+1}/${total}...`;
-
-                await new Promise((resolve) => {
-                    $.post('admin.php', { action: 'manual_invoice', order_id: id }, function(res) {
-                        let data = parseResponse(res);
+    <div class="bg-white rounded-xl shadow overflow-x-auto">
+        <table class="w-full text-left border-collapse whitespace-nowrap">
+            <thead class="bg-gray-800 text-white text-xs uppercase">
+                <tr>
+                    <th class="p-3 w-10 text-center"><input type="checkbox" id="selectAll"></th>
+                    <th class="p-3">ID / Data</th>
+                    <th class="p-3">Client</th>
+                    <th class="p-3">Livrare</th>
+                    <th class="p-3">Total</th>
+                    <th class="p-3 text-center">Factură</th>
+                    <th class="p-3 text-center">AWB</th>
+                    <th class="p-3 text-right">Acțiuni</th>
+                </tr>
+            </thead>
+            <tbody class="text-sm divide-y divide-gray-100">
+                <?php foreach($orders as $o): ?>
+                    <tr class="hover:bg-gray-50 transition cursor-pointer group" onclick="toggleRow(this)">
+                        <td class="p-3 text-center" onclick="event.stopPropagation()">
+                            <input type="checkbox" class="order-check" value="<?php echo $o['id']; ?>">
+                        </td>
                         
-                        if(data.success) {
-                            success++;
-                            row.removeClass('selected-row').addClass('bg-green-50');
-                            row.find('td[id^="status-"]').html('✅ OK');
-                            $(checkbox).prop('checked', false).prop('disabled', true);
-                            row.removeAttr('onclick').removeClass('cursor-pointer');
-                        } else {
-                            row.addClass('bg-red-50');
-                            console.error("Eroare Oblio ID " + id + ": " + data.message);
-                        }
-                        resolve();
-                    }).fail(function() {
-                        row.addClass('bg-red-50');
-                        resolve();
-                    });
-                });
+                        <td class="p-3">
+                            <div class="font-bold text-gray-700">#<?php echo $o['id']; ?></div>
+                            <div class="text-[10px] text-gray-400"><?php echo date('d.m H:i', strtotime($o['created_at'])); ?></div>
+                        </td>
+
+                        <td class="p-3">
+                            <div class="font-bold text-gray-800"><?php echo $o['full_name']; ?></div>
+                            <div class="text-xs text-blue-600"><?php echo $o['phone']; ?></div>
+                        </td>
+
+                        <td class="p-3">
+                            <div class="text-xs font-semibold">
+                                <?php echo ($o['shipping_method'] == 'easybox') ? '📦 EasyBox' : '🚚 Curier'; ?>
+                            </div>
+                            <div class="text-xs text-gray-500 truncate max-w-[150px]" title="<?php echo $o['city']; ?>">
+                                <?php echo $o['city']; ?>, <?php echo $o['county']; ?>
+                            </div>
+                        </td>
+
+                        <td class="p-3 font-bold">
+                            <?php echo $o['total_price']; ?> Lei
+                            <div class="text-[9px] text-gray-400 uppercase"><?php echo $o['payment_method']; ?></div>
+                        </td>
+
+                        <td class="p-3 text-center" id="inv-<?php echo $o['id']; ?>">
+                            <?php if($o['oblio_status'] == 1): ?>
+                                <a href="<?php echo $o['oblio_link']; ?>" target="_blank" class="badge badge-green hover:underline">Vezi PDF</a>
+                            <?php else: ?>
+                                <span class="badge badge-red">Lipsă</span>
+                            <?php endif; ?>
+                        </td>
+
+                        <td class="p-3 text-center" id="awb-<?php echo $o['id']; ?>">
+                            <?php if(!empty($o['awb_number'])): ?>
+                                <span class="badge badge-blue"><?php echo $o['awb_number']; ?></span>
+                            <?php else: ?>
+                                <span class="badge badge-red">Lipsă</span>
+                            <?php endif; ?>
+                        </td>
+
+                        <td class="p-3 text-right" onclick="event.stopPropagation()">
+                            <div class="flex justify-end gap-1 opacity-100 md:opacity-0 group-hover:opacity-100 transition">
+                                <button onclick='openEdit(<?php echo json_encode($o); ?>)' class="p-1 text-gray-400 hover:text-blue-600 border rounded">✏️</button>
+                                
+                                <?php if($o['oblio_status'] == 0): ?>
+                                    <button onclick="doAction(<?php echo $o['id']; ?>, 'generate_invoice')" class="px-2 py-1 text-xs bg-green-50 text-green-700 border border-green-200 rounded hover:bg-green-100">+F</button>
+                                <?php endif; ?>
+
+                                <?php if(empty($o['awb_number'])): ?>
+                                    <button onclick="doAction(<?php echo $o['id']; ?>, 'generate_awb')" class="px-2 py-1 text-xs bg-blue-50 text-blue-700 border border-blue-200 rounded hover:bg-blue-100">+A</button>
+                                <?php endif; ?>
+                            </div>
+                        </td>
+                    </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<div id="actionBar" class="fixed bottom-0 left-0 w-full bg-white border-t p-4 shadow-2xl transform slide-down transition-transform duration-300 flex justify-between items-center md:px-20 z-50">
+    <div class="font-bold text-gray-700">Selectate: <span id="selCount" class="text-blue-600">0</span></div>
+    <div class="flex gap-2">
+        <button onclick="processBulk('generate_invoice')" class="bg-green-600 text-white px-4 py-2 rounded text-sm font-bold shadow hover:bg-green-700">Generează Facturi</button>
+        <button onclick="processBulk('generate_awb')" class="bg-blue-600 text-white px-4 py-2 rounded text-sm font-bold shadow hover:bg-blue-700">Generează AWB</button>
+    </div>
+</div>
+
+<div id="editModal" class="fixed inset-0 bg-black/50 hidden z-50 flex items-center justify-center p-4">
+    <div class="bg-white rounded-xl shadow-2xl w-full max-w-md p-6">
+        <h2 class="text-lg font-bold mb-4">Editare Comandă</h2>
+        <form id="editForm" class="space-y-3">
+            <input type="hidden" name="action" value="update_order">
+            <input type="hidden" name="order_id" id="e_id">
+            <input class="w-full border p-2 rounded" name="full_name" id="e_name" placeholder="Nume">
+            <div class="flex gap-2">
+                <input class="w-1/2 border p-2 rounded" name="phone" id="e_phone" placeholder="Tel">
+                <input class="w-1/2 border p-2 rounded" name="email" id="e_email" placeholder="Email">
+            </div>
+            <div class="flex gap-2">
+                <input class="w-1/2 border p-2 rounded" name="county" id="e_county" placeholder="Județ">
+                <input class="w-1/2 border p-2 rounded" name="city" id="e_city" placeholder="Oraș">
+            </div>
+            <textarea class="w-full border p-2 rounded" name="address_line" id="e_addr" rows="2" placeholder="Adresă"></textarea>
+            <div class="flex gap-2 mt-4">
+                <button type="button" onclick="$('#editModal').addClass('hidden')" class="flex-1 bg-gray-200 py-2 rounded">Anulează</button>
+                <button type="submit" class="flex-1 bg-blue-600 text-white py-2 rounded">Salvează</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<script>
+    // 1. SELECTIE
+    function toggleRow(row) {
+        let chk = $(row).find('.order-check');
+        chk.prop('checked', !chk.prop('checked'));
+        chk.prop('checked') ? $(row).addClass('selected-row') : $(row).removeClass('selected-row');
+        updateBar();
+    }
+    $('#selectAll').change(function() {
+        let s = this.checked;
+        $('.order-check').prop('checked', s);
+        s ? $('tbody tr').addClass('selected-row') : $('tbody tr').removeClass('selected-row');
+        updateBar();
+    });
+    function updateBar() {
+        let c = $('.order-check:checked').length;
+        $('#selCount').text(c);
+        c > 0 ? $('#actionBar').removeClass('slide-down') : $('#actionBar').addClass('slide-down');
+    }
+
+    // 2. ACTIUNI SINGLE
+    function doAction(id, act) {
+        let btn = $(event.target);
+        let old = btn.text();
+        btn.text('...').prop('disabled', true);
+
+        $.post('admin.php', { action: act, order_id: id }, function(res) {
+            if(res.success) {
+                btn.replaceWith('<span class="text-xs text-green-600 font-bold">OK</span>');
+                if(act == 'generate_invoice') $('#inv-'+id).html('<span class="badge badge-green">Emisă</span>');
+                if(act == 'generate_awb') $('#awb-'+id).html('<span class="badge badge-blue">Generat</span>');
+            } else {
+                alert('Eroare: ' + res.message);
+                btn.text(old).prop('disabled', false);
             }
+        }, 'json');
+    }
 
-            txt.innerText = 'Gata! Refreshing...';
-            setTimeout(() => { location.reload(); }, 1000);
+    // 3. BULK
+    async function processBulk(act) {
+        let sel = $('.order-check:checked');
+        if(!sel.length || !confirm('Sigur?')) return;
+
+        for(let i=0; i<sel.length; i++) {
+            let id = $(sel[i]).val();
+            // Verificare sumară să nu refacem ce e gata
+            let row = $(sel[i]).closest('tr');
+            if(act == 'generate_invoice' && row.find('#inv-'+id).text().trim() != 'Lipsă') continue;
+            if(act == 'generate_awb' && row.find('#awb-'+id).text().trim() != 'Lipsă') continue;
+
+            await new Promise(r => {
+                $.post('admin.php', { action: act, order_id: id }, function(res) {
+                    if(res.success) {
+                        if(act == 'generate_invoice') row.find('#inv-'+id).html('<span class="badge badge-green">OK</span>');
+                        if(act == 'generate_awb') row.find('#awb-'+id).html('<span class="badge badge-blue">OK</span>');
+                    }
+                    r();
+                }, 'json');
+            });
         }
+        alert('Gata!');
+        location.reload();
+    }
 
-        // 4. AUTO TOGGLE
-        $('#autoToggle').change(function() {
-            $.post('admin.php', { toggle_auto: true, state: $(this).is(':checked') });
-        });
-    </script>
+    // 4. EDIT
+    function openEdit(o) {
+        $('#e_id').val(o.id);
+        $('#e_name').val(o.full_name);
+        $('#e_phone').val(o.phone);
+        $('#e_email').val(o.email);
+        $('#e_county').val(o.county);
+        $('#e_city').val(o.city);
+        $('#e_addr').val(o.address_line);
+        $('#editModal').removeClass('hidden');
+    }
+    $('#editForm').submit(function(e) {
+        e.preventDefault();
+        $.post('admin.php', $(this).serialize(), function(res) {
+            if(res.success) location.reload();
+            else alert(res.message);
+        }, 'json');
+    });
+
+    // AUTOMATIZARE — identic oclar GET/POST /api/admin/settings
+    function loadSettings() {
+        $.post('admin.php', {action:'get_settings'}, function(res) {
+            if (!res.success) return;
+            applySw('sw_automation_enabled', res.settings.automation_enabled);
+            applySw('sw_auto_oblio',         res.settings.auto_oblio);
+            applySw('sw_auto_ecolet',        res.settings.auto_ecolet);
+            updateAutobadge(res.settings.automation_enabled);
+        }, 'json');
+    }
+    function applySw(id, val) {
+        var cb = document.getElementById(id);
+        if (!cb) return;
+        cb.checked = !!val;
+        var lbl   = cb.closest('label') || cb.parentElement.parentElement;
+        var track = lbl.querySelector('.sw-track');
+        var thumb = lbl.querySelector('.sw-thumb');
+        if (track) track.style.background = val ? '#10b981' : '';
+        if (thumb) thumb.style.transform  = val ? 'translateX(20px)' : '';
+    }
+    function updateAutobage(en) { updateAutobage_inner(en); }
+    function updateAutobage_inner(en) {
+        var b = document.getElementById('autoStatusBadge');
+        if (!b) return;
+        b.textContent   = en ? 'ACTIV' : 'OPRIT';
+        b.className     = en ? 'text-xs px-2 py-1 rounded font-bold bg-green-100 text-green-700'
+                             : 'text-xs px-2 py-1 rounded font-bold bg-red-100 text-red-600';
+    }
+    function updateAutobage(en) { updateAutobage_inner(en); }
+    $('.auto-switch').on('change', function() {
+        var key = $(this).data('key');
+        var val = this.checked;
+        applySw(this.id, val);
+        if (key === 'automation_enabled') updateAutobage(val);
+        $.post('admin.php', {action:'update_setting', key:key, value: val?'true':'false'}, null, 'json');
+    });
+    loadSettings();
+</script>
+
 </body>
 </html>
